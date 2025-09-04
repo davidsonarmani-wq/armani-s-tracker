@@ -1,0 +1,406 @@
+import pandas as pd
+import pandas_datareader.data as web
+import datetime
+import plotly.graph_objs as go
+import ipywidgets as widgets
+from IPython.display import display, HTML, clear_output
+
+# --------------------------
+# CONFIG
+# --------------------------
+treasury_codes = {
+    "2Y": "DGS2",
+    "5Y": "DGS5",
+    "10Y": "DGS10"
+}
+
+treasury_estimates = {
+    "Alice": 4.00,
+    "Bob": 4.25,
+    "Charlie": 3.85,
+    "You": 4.10
+}
+
+aaa_estimates = {
+    "Alice": 130,
+    "Bob": 140,
+    "Charlie": 125,
+    "You": 135
+}
+
+aaa_file_path = r"y:/RMS/Mkt Snap.xls"   # Excel file path
+
+# --------------------------
+# HELPER FUNCTIONS
+# --------------------------
+def get_treasury_data(code):
+    start = datetime.datetime(2025, 1, 1)
+    end = datetime.datetime.today()
+    df = web.DataReader(code, "fred", start, end)
+    df = df.rename(columns={code: "Yield"}).dropna()
+    return df
+
+def get_aaa_data():
+    df = pd.read_excel(aaa_file_path)
+    df["Pricing Date"] = pd.to_datetime(df["Pricing Date"])
+    df = df[df["Rating"] == "AAA"]
+
+    # Average within deals
+    deal_avg = df.groupby(["Pricing Date", "Deal ID"]).agg(
+        Spread=("Spread", "mean"),
+        Balance=("Balance", "sum")
+    ).reset_index()
+
+    # Weighted average across deals
+    daily_avg = deal_avg.groupby("Pricing Date").apply(
+        lambda x: (x["Spread"] * x["Balance"]).sum() / x["Balance"].sum()
+    ).reset_index(name="AAA Spread")
+
+    return daily_avg
+
+def format_leaderboard(ranked):
+    medals = ["🥇", "🥈", "🥉"]
+    rows = []
+    for i, (name, row) in enumerate(ranked.iterrows()):
+        medal = medals[i] if i < 3 else " "
+        rows.append(f"<tr><td>{medal} {name}</td><td>{row['Year-End Estimate']:.2f}</td><td>{row['Distance']:.2f}</td></tr>")
+    table = "<table><tr><th>Rank</th><th>Estimate</th><th>Distance</th></tr>" + "".join(rows) + "</table>"
+    return HTML(table)
+
+# --------------------------
+# PLOT FUNCTIONS
+# --------------------------
+def plot_treasury(maturity):
+    df = get_treasury_data(treasury_codes[maturity])
+    latest_date = df.index[-1]
+    latest_yield = df["Yield"].iloc[-1]
+
+    estimates_df = pd.DataFrame.from_dict(treasury_estimates, orient="index", columns=["Year-End Estimate"])
+    estimates_df["Distance"] = (estimates_df["Year-End Estimate"] - latest_yield).abs()
+    ranked = estimates_df.sort_values("Distance")
+
+    color_map = {"2Y": "blue", "5Y": "green", "10Y": "red"}
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["Yield"],
+        mode="lines",
+        name=f"{maturity} Treasury",
+        line=dict(color=color_map[maturity], width=2),
+        hovertemplate="Date: %{x|%Y-%m-%d}<br>Yield: %{y:.2f}%<extra></extra>"
+    ))
+
+    for name, val in treasury_estimates.items():
+        fig.add_hline(y=val, line_dash="dash", annotation_text=f"{name}: {val}%", annotation_position="right")
+
+    winner = ranked.index[0]
+    fig.add_annotation(
+        x=latest_date,
+        y=treasury_estimates[winner],
+        text=f"🏆 {winner} is closest!",
+        showarrow=True,
+        arrowhead=2,
+        font=dict(color="gold", size=14)
+    )
+
+    fig.update_layout(
+        title=f"{maturity} Treasury Yield (2025)",
+        yaxis_title="Yield (%)",
+        xaxis_title="Date",
+        template="plotly_white",
+        hovermode="x unified"
+    )
+
+    display(fig)
+    display(format_leaderboard(ranked))
+
+def plot_aaa():
+    df = get_aaa_data()
+    latest_date = df["Pricing Date"].iloc[-1]
+    latest_spread = df["AAA Spread"].iloc[-1]
+
+    estimates_df = pd.DataFrame.from_dict(aaa_estimates, orient="index", columns=["Year-End Estimate"])
+    estimates_df["Distance"] = (estimates_df["Year-End Estimate"] - latest_spread).abs()
+    ranked = estimates_df.sort_values("Distance")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["Pricing Date"], y=df["AAA Spread"],
+        mode="lines+markers",
+        name="AAA Non-QM Spread",
+        line=dict(color="purple", width=2),
+        marker=dict(color="purple", size=6),
+        hovertemplate="Date: %{x|%Y-%m-%d}<br>Spread: %{y:.1f} bps<extra></extra>"
+    ))
+
+    for name, val in aaa_estimates.items():
+        fig.add_hline(y=val, line_dash="dash", annotation_text=f"{name}: {val}", annotation_position="right")
+
+    winner = ranked.index[0]
+    fig.add_annotation(
+        x=latest_date,
+        y=aaa_estimates[winner],
+        text=f"🏆 {winner} is closest!",
+        showarrow=True,
+        arrowhead=2,
+        font=dict(color="gold", size=14)
+    )
+
+    fig.update_layout(
+        title="AAA Non-QM Weighted Average Spread",
+        yaxis_title="Spread (bps)",
+        xaxis_title="Date",
+        template="plotly_white",
+        hovermode="x unified"
+    )
+
+    display(fig)
+    display(format_leaderboard(ranked))
+
+# --------------------------
+# TAB WIDGETS
+# --------------------------
+maturity_dropdown = widgets.Dropdown(
+    options=list(treasury_codes.keys()),
+    value="5Y",
+    description="Maturity:"
+)
+
+refresh_button_treasury = widgets.Button(description="🔄 Refresh Treasury Data")
+refresh_button_aaa = widgets.Button(description="🔄 Refresh AAA Data")
+
+treasury_output = widgets.Output()
+aaa_output = widgets.Output()
+
+def refresh_treasury(b=None):
+    with treasury_output:
+        clear_output(wait=True)
+        display(maturity_dropdown, refresh_button_treasury)
+        plot_treasury(maturity_dropdown.value)
+
+def refresh_aaa(b=None):
+    with aaa_output:
+        clear_output(wait=True)
+        display(refresh_button_aaa)
+        plot_aaa()
+
+maturity_dropdown.observe(lambda change: refresh_treasury(), names="value")
+refresh_button_treasury.on_click(refresh_treasury)
+refresh_button_aaa.on_click(refresh_aaa)
+
+refresh_treasury()
+refresh_aaa()
+
+# Tabs
+tab = widgets.Tab(children=[treasury_output, aaa_output])
+tab.set_title(0, "Treasuries")
+tab.set_title(1, "AAA Non-QM")
+
+display(tab)
+
+# Footer credit
+footer = HTML("<p style='text-align:center; font-size:12px; color:gray;'>Created by Armani Davidson</p>")
+display(footer)
+
+#break
+import pandas as pd
+import pandas_datareader.data as web
+import datetime
+import plotly.graph_objs as go
+import ipywidgets as widgets
+from IPython.display import display, HTML, clear_output
+
+# --------------------------
+# CONFIG
+# --------------------------
+treasury_codes = {
+    "2Y": "DGS2",
+    "5Y": "DGS5",
+    "10Y": "DGS10"
+}
+
+treasury_estimates = {
+    "Alice": 4.00,
+    "Bob": 4.25,
+    "Charlie": 3.85,
+    "You": 4.10
+}
+
+aaa_estimates = {
+    "Alice": 130,
+    "Bob": 140,
+    "Charlie": 125,
+    "You": 135
+}
+
+aaa_file_path = r"y:/RMS/Mkt Snap.xls"   # Excel file path
+
+# --------------------------
+# HELPER FUNCTIONS
+# --------------------------
+def get_treasury_data(code):
+    start = datetime.datetime(2025, 1, 1)
+    end = datetime.datetime.today()
+    df = web.DataReader(code, "fred", start, end)
+    df = df.rename(columns={code: "Yield"}).dropna()
+    return df
+
+def get_aaa_data():
+    df = pd.read_excel(aaa_file_path)
+    df["Pricing Date"] = pd.to_datetime(df["Pricing Date"])
+    df = df[df["Rating"] == "AAA"]
+
+    # Average within deals
+    deal_avg = df.groupby(["Pricing Date", "Deal ID"]).agg(
+        Spread=("Spread", "mean"),
+        Balance=("Balance", "sum")
+    ).reset_index()
+
+    # Weighted average across deals
+    daily_avg = deal_avg.groupby("Pricing Date").apply(
+        lambda x: (x["Spread"] * x["Balance"]).sum() / x["Balance"].sum()
+    ).reset_index(name="AAA Spread")
+
+    return daily_avg
+
+def format_leaderboard(ranked):
+    medals = ["🥇", "🥈", "🥉"]
+    rows = []
+    for i, (name, row) in enumerate(ranked.iterrows()):
+        medal = medals[i] if i < 3 else " "
+        rows.append(f"<tr><td>{medal} {name}</td><td>{row['Year-End Estimate']:.2f}</td><td>{row['Distance']:.2f}</td></tr>")
+    table = "<table><tr><th>Rank</th><th>Estimate</th><th>Distance</th></tr>" + "".join(rows) + "</table>"
+    return HTML(table)
+
+# --------------------------
+# PLOT FUNCTIONS
+# --------------------------
+def plot_treasury(maturity):
+    df = get_treasury_data(treasury_codes[maturity])
+    latest_date = df.index[-1]
+    latest_yield = df["Yield"].iloc[-1]
+
+    estimates_df = pd.DataFrame.from_dict(treasury_estimates, orient="index", columns=["Year-End Estimate"])
+    estimates_df["Distance"] = (estimates_df["Year-End Estimate"] - latest_yield).abs()
+    ranked = estimates_df.sort_values("Distance")
+
+    color_map = {"2Y": "blue", "5Y": "green", "10Y": "red"}
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["Yield"],
+        mode="lines",
+        name=f"{maturity} Treasury",
+        line=dict(color=color_map[maturity], width=2),
+        hovertemplate="Date: %{x|%Y-%m-%d}<br>Yield: %{y:.2f}%<extra></extra>"
+    ))
+
+    for name, val in treasury_estimates.items():
+        fig.add_hline(y=val, line_dash="dash", annotation_text=f"{name}: {val}%", annotation_position="right")
+
+    winner = ranked.index[0]
+    fig.add_annotation(
+        x=latest_date,
+        y=treasury_estimates[winner],
+        text=f"🏆 {winner} is closest!",
+        showarrow=True,
+        arrowhead=2,
+        font=dict(color="gold", size=14)
+    )
+
+    fig.update_layout(
+        title=f"{maturity} Treasury Yield (2025)",
+        yaxis_title="Yield (%)",
+        xaxis_title="Date",
+        template="plotly_white",
+        hovermode="x unified"
+    )
+
+    display(fig)
+    display(format_leaderboard(ranked))
+
+def plot_aaa():
+    df = get_aaa_data()
+    latest_date = df["Pricing Date"].iloc[-1]
+    latest_spread = df["AAA Spread"].iloc[-1]
+
+    estimates_df = pd.DataFrame.from_dict(aaa_estimates, orient="index", columns=["Year-End Estimate"])
+    estimates_df["Distance"] = (estimates_df["Year-End Estimate"] - latest_spread).abs()
+    ranked = estimates_df.sort_values("Distance")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["Pricing Date"], y=df["AAA Spread"],
+        mode="lines+markers",
+        name="AAA Non-QM Spread",
+        line=dict(color="purple", width=2),
+        marker=dict(color="purple", size=6),
+        hovertemplate="Date: %{x|%Y-%m-%d}<br>Spread: %{y:.1f} bps<extra></extra>"
+    ))
+
+    for name, val in aaa_estimates.items():
+        fig.add_hline(y=val, line_dash="dash", annotation_text=f"{name}: {val}", annotation_position="right")
+
+    winner = ranked.index[0]
+    fig.add_annotation(
+        x=latest_date,
+        y=aaa_estimates[winner],
+        text=f"🏆 {winner} is closest!",
+        showarrow=True,
+        arrowhead=2,
+        font=dict(color="gold", size=14)
+    )
+
+    fig.update_layout(
+        title="AAA Non-QM Weighted Average Spread",
+        yaxis_title="Spread (bps)",
+        xaxis_title="Date",
+        template="plotly_white",
+        hovermode="x unified"
+    )
+
+    display(fig)
+    display(format_leaderboard(ranked))
+
+# --------------------------
+# TAB WIDGETS
+# --------------------------
+maturity_dropdown = widgets.Dropdown(
+    options=list(treasury_codes.keys()),
+    value="5Y",
+    description="Maturity:"
+)
+
+refresh_button_treasury = widgets.Button(description="🔄 Refresh Treasury Data")
+refresh_button_aaa = widgets.Button(description="🔄 Refresh AAA Data")
+
+treasury_output = widgets.Output()
+aaa_output = widgets.Output()
+
+def refresh_treasury(b=None):
+    with treasury_output:
+        clear_output(wait=True)
+        display(maturity_dropdown, refresh_button_treasury)
+        plot_treasury(maturity_dropdown.value)
+
+def refresh_aaa(b=None):
+    with aaa_output:
+        clear_output(wait=True)
+        display(refresh_button_aaa)
+        plot_aaa()
+
+maturity_dropdown.observe(lambda change: refresh_treasury(), names="value")
+refresh_button_treasury.on_click(refresh_treasury)
+refresh_button_aaa.on_click(refresh_aaa)
+
+refresh_treasury()
+refresh_aaa()
+
+# Tabs
+tab = widgets.Tab(children=[treasury_output, aaa_output])
+tab.set_title(0, "Treasuries")
+tab.set_title(1, "AAA Non-QM")
+
+display(tab)
+
+# Footer credit
+footer = HTML("<p style='text-align:center; font-size:12px; color:gray;'>Created by Armani Davidson</p>")
+display(footer)
