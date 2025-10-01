@@ -1,0 +1,74 @@
+import folium
+from geopy.distance import geodesic
+
+# Example MSAs (lat/lon for demo, normally you'd load from dataset)
+all_msas = [
+    {"name": "New York-Newark-Jersey City, NY-NJ-PA", "lat": 40.7128, "lon": -74.0060},
+    {"name": "Los Angeles-Long Beach-Anaheim, CA", "lat": 34.0522, "lon": -118.2437},
+    {"name": "Chicago-Naperville-Elgin, IL-IN-WI", "lat": 41.8781, "lon": -87.6298},
+    {"name": "Dallas-Fort Worth-Arlington, TX", "lat": 32.7767, "lon": -96.7970},
+    {"name": "Houston-The Woodlands-Sugar Land, TX", "lat": 29.7604, "lon": -95.3698},
+    {"name": "Miami-Fort Lauderdale-West Palm Beach, FL", "lat": 25.7617, "lon": -80.1918},
+    {"name": "Atlanta-Sandy Springs-Alpharetta, GA", "lat": 33.7490, "lon": -84.3880},
+    {"name": "Washington-Arlington-Alexandria, DC-VA-MD-WV", "lat": 38.9072, "lon": -77.0369},
+    {"name": "Philadelphia-Camden-Wilmington, PA-NJ-DE-MD", "lat": 39.9526, "lon": -75.1652},
+    {"name": "Phoenix-Mesa-Chandler, AZ", "lat": 33.4484, "lon": -112.0740},
+    # nearby ones for demo
+    {"name": "San Diego-Chula Vista-Carlsbad, CA", "lat": 32.7157, "lon": -117.1611},
+    {"name": "San Antonio-New Braunfels, TX", "lat": 29.4241, "lon": -98.4936},
+    {"name": "Tampa-St. Petersburg-Clearwater, FL", "lat": 27.9506, "lon": -82.4572},
+    {"name": "Baltimore-Columbia-Towson, MD", "lat": 39.2904, "lon": -76.6122},
+    {"name": "Detroit-Warren-Dearborn, MI", "lat": 42.3314, "lon": -83.0458},
+    {"name": "Orlando-Kissimmee-Sanford, FL", "lat": 28.5383, "lon": -81.3792},
+    {"name": "Riverside-San Bernardino-Ontario, CA", "lat": 34.0522, "lon": -117.2437},
+    {"name": "Minneapolis-St. Paul-Bloomington, MN-WI", "lat": 44.9778, "lon": -93.2650},
+    {"name": "Charlotte-Concord-Gastonia, NC-SC", "lat": 35.2271, "lon": -80.8431},
+    {"name": "Cleveland-Elyria, OH", "lat": 41.4993, "lon": -81.6944}
+]
+
+# Pick 10 top MSAs (first 10 in this demo list)
+top_msas = all_msas[:10]
+
+# Parameters
+distance_threshold_miles = 300  # how far to look for neighbors
+
+# Create map centered on US
+m = folium.Map(location=[39.5, -98.35], zoom_start=4, tiles="CartoDB positron")
+
+# Feature groups
+top_layer = folium.FeatureGroup(name="Top 10 MSAs")
+neighbor_layer = folium.FeatureGroup(name="Nearby MSAs")
+
+# Add top MSAs (red markers)
+for top in top_msas:
+    folium.CircleMarker(
+        location=[top["lat"], top["lon"]],
+        radius=8,
+        color="red",
+        fill=True,
+        fill_opacity=0.9,
+        popup=f"Top MSA: {top['name']}"
+    ).add_to(top_layer)
+    
+    # Find nearby MSAs within threshold
+    for msa in all_msas:
+        if msa["name"] == top["name"]:
+            continue
+        dist = geodesic((top["lat"], top["lon"]), (msa["lat"], msa["lon"])).miles
+        if dist <= distance_threshold_miles:
+            folium.CircleMarker(
+                location=[msa["lat"], msa["lon"]],
+                radius=6,
+                color="blue",
+                fill=True,
+                fill_opacity=0.6,
+                popup=f"Nearby to {top['name']}: {msa['name']} ({dist:.0f} mi)"
+            ).add_to(neighbor_layer)
+
+# Add layers
+top_layer.add_to(m)
+neighbor_layer.add_to(m)
+folium.LayerControl().add_to(m)
+
+# Save HTML
+m.save("msa_malls_neighbors.html")
