@@ -1,0 +1,286 @@
+!streamlit run dashboard.py
+streamlit run dashboard.py
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import os
+from datetime import datetime
+pip install watchdog
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import os
+import time
+import threading
+from datetime import datetime
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# ======================================================
+# CONFIGURATION
+# ======================================================
+st.set_page_config(page_title="MBS Deal Dashboard", layout="wide")
+st.title("🏦 MBS Deal Analytics Dashboard")
+
+DATA_FOLDER = "C:/Users/Armani/Documents/MBS_Data"
+ARCHIVE_FOLDER = "C:/Users/Armani/Documents/MBS_Archive"
+
+# ======================================================
+# FILE WATCHER SETUP
+# ======================================================
+class MktSnapshotHandler(FileSystemEventHandler):
+    def __init__(self, trigger_reload):
+        super().__init__()
+        self.trigger_reload = trigger_reload
+
+    def on_any_event(self, event):
+        if not event.is_directory and "mktsnapshot" in event.src_path.lower():
+            self.trigger_reload()
+
+@st.cache_resource
+def start_file_watcher(callback):
+    observer = Observer()
+    handler = MktSnapshotHandler(callback)
+    observer.schedule(handler, DATA_FOLDER, recursive=False)
+    observer.daemon = True
+    observer.start()
+    return observer
+
+def mark_reload_needed():
+    st.session_state["reload_needed"] = True
+
+
+# ======================================================
+# DATA LOADING & ARCHIVING
+# ======================================================
+@st.cache_data(ttl=300, show_spinner=True)
+def load_mktsnapshots(folder_path=DATA_FOLDER, archive_path=ARCHIVE_FOLDER):
+    dfs = []
+    files = [f for f in os.listdir(folder_path)
+             if f.lower().startswith("mktsnapshot") and f.lower().endswith((".xls", ".xlsx"))]
+
+    if not files:
+        return pd.DataFrame()
+
+    files = sorted(files, key=lambda x: os.path.getmtime(os.path.join(folder_path, x)))
+
+    for file in files:
+        full_path = os.path.join(folder_path, file)
+        try:
+            df = pd.read_excel(full_path, header=1)
+            df["Source_File"] = file
+            dfs.append(df)
+        except Exception as e:
+            st.warning(f"⚠️ Could not read {file}: {e}")
+
+    df = pd.concat(dfs, ignore_index=True)
+    df.columns = [c.strip().replace(" ", "_").replace("-", "_") for c in df.columns]
+
+    df["Pricing_Date"] = pd.to_datetime(df.get("Pricing_Date", pd.NaT), errors="coerce")
+    df["Settle_Date"] = pd.to_datetime(df.get("Settle_Date", pd.NaT), errors="coerce")
+
+    # Archive older files
+    if len(files) > 1:
+        latest = files[-1]
+        os.makedirs(archive_path, exist_ok=True)
+        for f in files[:-1]:
+            src = os.path.join(folder_path, f)
+            dst = os.path.join(archive_path, f)
+            try:
+                os.replace(src, dst)
+            except Exception as e:
+                st.warning(f"Could not archive {f}: {e}")
+
+    return df
+
+
+# ======================================================
+# INIT FILE WATCHER
+# ======================================================
+if "reload_needed" not in st.session_state:
+    st.session_state["reload_needed"] = False
+
+def refresh_data():
+    st.session_state["reload_needed"] = True
+
+# Start background watcher once
+start_file_watcher(refresh_data)
+
+if st.session_state["reload_needed"]:
+    load_mktsnapshots.clear()
+    st.session_state["reload_needed"] = False
+
+# ======================================================
+# LOAD DATA
+# ======================================================
+df = load_mktsnapshots()
+
+if df.empty:
+    st.error("No MktSnapshot Excel files found in data folder.")
+    st.stop()
+
+st.sidebar.success("✅ Watching folder for updates")
+
+# ======================================================
+# SIDEBAR FILTERS
+# ======================================================
+st.sidebar.header("🔍 Filters")
+
+min_date, max_date = df["Pricing_Date"].min(), df["Pricing_Date"].max()
+pricing_date_range = st.sidebar.date_input("Pricing Date Range", [min_date, max_date])
+settle_date_range = st.sidebar.date_input("Settle Date Range", [min_date, max_date])
+
+selected_deals = st.sidebar.multiselect("Select Deals", sorted(df["Deal"].dropna().unique()))
+selected_sector = st.sidebar.multiselect("Select Sector", sorted(df["Sector"].dropna().unique()))
+selected_sponsor = st.sidebar.multiselect("Select Sponsor", sorted(df["Sponsor"].dropna().unique()))
+selected_ratings = st.sidebar.multiselect("Select Ratings", sorted(df["Ratings"].dropna().unique()))
+selected_lead = st.sidebar.multiselect("Select Lead Left", sorted(df["Lead_Left"].dropna().unique()))
+
+coupon_min, coupon_max = float(df["Coupon"].min()), float(df["Coupon"].max())
+coupon_range = st.sidebar.slider("Coupon Range", coupon_min, coupon_max, (coupon_min, coupon_max))
+
+totals_only = st.sidebar.checkbox("Show Totals Only", value=False)
+
+# ======================================================
+# FILTER DATA
+# ======================================================
+filtered = df.copy()
+filtered = filtered[
+    (filtered["Pricing_Date"].between(pd.to_datetime(pricing_date_range[0]), pd.to_datetime(pricing_date_range[1])))
+    & (filtered["Settle_Date"].between(pd.to_datetime(settle_date_range[0]), pd.to_datetime(settle_date_range[1])))
+    & (filtered["Coupon"].between(coupon_range[0], coupon_range[1]))
+]
+
+if selected_deals:
+    filtered = filtered[filtered["Deal"].isin(selected_deals)]
+if selected_sector:
+    filtered = filtered[filtered["Sector"].isin(selected_sector)]
+if selected_sponsor:
+    filtered = filtered[filtered["Sponsor"].isin(selected_sponsor)]
+if selected_ratings:
+    filtered = filtered[filtered["Ratings"].isin(selected_ratings)]
+if selected_lead:
+    filtered = filtered[filtered["Lead_Left"].isin(selected_lead)]
+
+if totals_only:
+    filtered = filtered[filtered["Class"].astype(str).str.lower() == "total"]
+
+# ======================================================
+# SUMMARY METRICS
+# ======================================================
+st.subheader("📈 Summary Metrics by Deal")
+if not filtered.empty:
+    summary = filtered.groupby("Deal").agg(
+        Avg_Spread=("Spread", "mean"),
+        Avg_Yield=("Yield", "mean"),
+        Total_Volume_mm=("Max_mm_", "sum"),
+        Num_Classes=("Class", "count"),
+    ).reset_index()
+    st.dataframe(summary, use_container_width=True)
+else:
+    st.warning("No data found with current filters.")
+
+# ======================================================
+# MAIN TABLE
+# ======================================================
+st.subheader("🔢 Detailed Table")
+st.dataframe(filtered, use_container_width=True)
+csv = filtered.to_csv(index=False).encode("utf-8")
+st.download_button("💾 Download Filtered Data (CSV)", csv, "filtered_data.csv", "text/csv")
+
+# ======================================================
+# CHARTS
+# ======================================================
+st.subheader("📊 Key Charts")
+col1, col2 = st.columns(2)
+with col1:
+    if "WAL" in filtered and "Yield" in filtered:
+        fig1 = px.scatter(filtered, x="WAL", y="Yield", color="Deal", title="WAL vs Yield", hover_data=["Class"])
+        st.plotly_chart(fig1, use_container_width=True)
+with col2:
+    if "Spread" in filtered and "Ratings" in filtered:
+        fig2 = px.box(filtered, x="Ratings", y="Spread", color="Sector", title="Spread vs Ratings")
+        st.plotly_chart(fig2, use_container_width=True)
+
+# ======================================================
+# DEAL COMPARISON
+# ======================================================
+st.subheader("⚖️ Deal Comparison Charts")
+if not filtered.empty:
+    fig_compare = px.bar(
+        summary,
+        x="Deal",
+        y="Avg_Spread",
+        color="Deal",
+        title="Average Spread by Deal",
+        hover_data=["Avg_Yield", "Total_Volume_mm"],
+    )
+    st.plotly_chart(fig_compare, use_container_width=True)
+
+# ======================================================
+# WEIGHTED SPREAD TRENDS
+# ======================================================
+st.markdown("### 🕒 Weighted Spread Trends by Collateral Type")
+
+if "Class" not in df or "Spread" not in df or "Max_mm_" not in df:
+    st.warning("Required columns missing for spread analysis.")
+else:
+    non_total = df[df["Class"].astype(str).str.lower() != "total"].copy()
+    non_total["Pricing_Date"] = pd.to_datetime(non_total["Pricing_Date"], errors="coerce")
+
+    agg_mode = st.radio("Aggregation Level", ["Weekly", "Monthly"], horizontal=True)
+    if agg_mode == "Weekly":
+        non_total["Period"] = non_total["Pricing_Date"].dt.to_period("W").apply(lambda r: r.start_time)
+    else:
+        non_total["Period"] = non_total["Pricing_Date"].dt.to_period("M").apply(lambda r: r.start_time)
+
+    weighted = (
+        non_total.groupby(["Sector", "Pricing_Speed", "Period"])
+        .apply(lambda x: (x["Spread"] * x["Max_mm_"]).sum() / x["Max_mm_"].sum())
+        .reset_index(name="Weighted_Spread")
+    )
+
+    spread_bounds = (
+        non_total.groupby(["Sector", "Pricing_Speed", "Period"])
+        .agg(Min_Spread=("Spread", "min"), Max_Spread=("Spread", "max"))
+        .reset_index()
+    )
+    weighted = weighted.merge(spread_bounds, on=["Sector", "Pricing_Speed", "Period"], how="left")
+
+    weighted["Δ_Spread"] = weighted.groupby(["Sector", "Pricing_Speed"])["Weighted_Spread"].diff()
+    weighted["Δ_Spread_pct"] = weighted["Δ_Spread"] / weighted["Weighted_Spread"].shift(1) * 100
+
+    selected_speed = st.selectbox("Select Pricing Speed", sorted(weighted["Pricing_Speed"].unique()))
+    w_filtered = weighted[weighted["Pricing_Speed"] == selected_speed]
+
+    if not w_filtered.empty:
+        w_filtered["Color"] = w_filtered["Δ_Spread"].apply(lambda x: "green" if x < 0 else "red")
+
+        fig_wow = px.line(
+            w_filtered,
+            x="Period",
+            y="Weighted_Spread",
+            color="Sector",
+            markers=True,
+            title=f"{agg_mode} Weighted Spread by Collateral Type ({selected_speed})",
+            hover_data={
+                "Δ_Spread": ":.2f",
+                "Δ_Spread_pct": ":.2f",
+                "Min_Spread": ":.2f",
+                "Max_Spread": ":.2f",
+            },
+        )
+        st.plotly_chart(fig_wow, use_container_width=True)
+
+        st.subheader("📉 Spread Change by Sector")
+        fig_delta = px.bar(
+            w_filtered,
+            x="Sector",
+            y="Δ_Spread",
+            color="Color",
+            title=f"{agg_mode} Δ Spread by Sector ({selected_speed})",
+            color_discrete_map={"green": "green", "red": "red"},
+            hover_data=["Δ_Spread_pct"],
+        )
+        st.plotly_chart(fig_delta, use_container_width=True)
