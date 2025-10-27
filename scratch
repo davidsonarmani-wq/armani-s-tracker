@@ -1,0 +1,42 @@
+import pandas as pd
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
+
+# === Step 1: Load Excel ===
+file_path = "your_file.xlsm"  # <-- update path
+df = pd.read_excel(file_path, header=1)  # start from A2
+
+# === Step 2: Filter for Total class ===
+total_df = df[df["Class"].str.lower() == "total"].copy()
+
+# === Step 3: Calculate size in billions ===
+total_df["Size (bn)"] = total_df["Max (mm)"] / 1000
+
+# === Step 4: Create PowerPoint ===
+prs = Presentation()
+
+for _, row in total_df.iterrows():
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    shapes = slide.shapes
+    
+    title_box = shapes.title or shapes.add_textbox(Inches(1), Inches(0.5), Inches(8), Inches(1))
+    title = title_box.text_frame
+    title.text = f"{row['Deal']}"
+
+    text_box = shapes.add_textbox(Inches(1), Inches(1.5), Inches(8), Inches(3))
+    tf = text_box.text_frame
+    tf.word_wrap = True
+    p = tf.add_paragraph()
+    p.text = (
+        f"Issuer: {row['Sponsor']}\n"
+        f"Collateral: {row['Sector']}\n"
+        f"Lead: {row['Lead']}\n"
+        f"Size (bn): {row['Size (bn)']:.2f}"
+    )
+    p.font.size = Pt(18)
+
+# === Step 5: Save ===
+output_path = "Deal_Summary_Priced.pptx"
+prs.save(output_path)
+print(f"✅ PowerPoint created: {output_path}")
