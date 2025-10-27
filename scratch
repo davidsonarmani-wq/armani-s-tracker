@@ -2,41 +2,73 @@ import pandas as pd
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN
+from datetime import datetime
 
 # === Step 1: Load Excel ===
-file_path = "your_file.xlsm"  # <-- update path
-df = pd.read_excel(file_path, header=1)  # start from A2
+file_path = "your_file.xlsm"  # update path as needed
+df = pd.read_excel(file_path, header=1)
 
-# === Step 2: Filter for Total class ===
-total_df = df[df["Class"].str.lower() == "total"].copy()
+# Ensure date columns are in datetime format
+df["Pricing Date"] = pd.to_datetime(df["Pricing Date"], errors="coerce")
+
+# === Step 2: Filter for Total class and a specific date range ===
+# Example: select deals priced in a specific week
+start_date = datetime(2025, 10, 20)
+end_date = datetime(2025, 10, 26)
+
+filtered_df = df[(df["Class"].str.lower() == "total") &
+                 (df["Pricing Date"] >= start_date) & (df["Pricing Date"] <= end_date)].copy()
 
 # === Step 3: Calculate size in billions ===
-total_df["Size (bn)"] = total_df["Max (mm)"] / 1000
+filtered_df["Size (bn)"] = filtered_df["Max (mm)"] / 1000
 
-# === Step 4: Create PowerPoint ===
+# === Step 4: Create Comment bullets ===
+filtered_df["Comment"] = (
+    "• Overview Rated (" + filtered_df["Ratings"].astype(str) + 
+    ") deal by " + filtered_df["Lead"].astype(str) + "; Pricing " + filtered_df["Pricing Speed"].astype(str) + "\n" +
+    "• Rating: " + filtered_df["Ratings"].astype(str) + ", Spread-N/I: " + filtered_df["Spread-N/I"].astype(str) + "\n" +
+    "• Rating: " + filtered_df["Ratings"].astype(str) + ", IPTs: " + filtered_df["IPTs"].astype(str)
+)
+
+# === Step 5: Create PowerPoint ===
 prs = Presentation()
+slide = prs.slides.add_slide(prs.slide_layouts[5])
 
-for _, row in total_df.iterrows():
-    slide = prs.slides.add_slide(prs.slide_layouts[5])
-    shapes = slide.shapes
-    
-    title_box = shapes.title or shapes.add_textbox(Inches(1), Inches(0.5), Inches(8), Inches(1))
-    title = title_box.text_frame
-    title.text = f"{row['Deal']}"
+# Add title
+title_box = slide.shapes.add_textbox(Inches(1), Inches(0.3), Inches(8), Inches(0.8))
+title_tf = title_box.text_frame
+title_tf.text = f"Deals Priced Week of {start_date.strftime('%b %d, %Y')}"
+title_tf.paragraphs[0].font.size = Pt(24)
+title_tf.paragraphs[0].alignment = PP_ALIGN.CENTER
 
-    text_box = shapes.add_textbox(Inches(1), Inches(1.5), Inches(8), Inches(3))
-    tf = text_box.text_frame
-    tf.word_wrap = True
-    p = tf.add_paragraph()
-    p.text = (
-        f"Issuer: {row['Sponsor']}\n"
-        f"Collateral: {row['Sector']}\n"
-        f"Lead: {row['Lead']}\n"
-        f"Size (bn): {row['Size (bn)']:.2f}"
-    )
-    p.font.size = Pt(18)
+# === Step 6: Create Table ===
+rows, cols = len(filtered_df) + 1, 5
+left, top, width, height = Inches(0.5), Inches(1.2), Inches(9), Inches(0.8 + 0.4 * rows)
+table = slide.shapes.add_table(rows, cols, left, top, width, height).table
 
-# === Step 5: Save ===
-output_path = "Deal_Summary_Priced.pptx"
+# Set headers
+headers = ["Deal", "Collat.", "Lead", "Size (bn)", "Comment"]
+for i, h in enumerate(headers):
+    cell = table.cell(0, i)
+    cell.text = h
+    cell.text_frame.paragraphs[0].font.bold = True
+
+# Populate rows
+for r, (_, row) in enumerate(filtered_df.iterrows(), start=1):
+    table.cell(r, 0).text = str(row["Deal"])
+    table.cell(r, 1).text = str(row["Sector"])
+    table.cell(r, 2).text = str(row["Lead"])
+    table.cell(r, 3).text = f"{row['Size (bn)']:.2f}"
+    table.cell(r, 4).text = row["Comment"]
+
+# Auto-size font
+for row in table.rows:
+    for cell in row.cells:
+        for paragraph in cell.text_frame.paragraphs:
+            for run in paragraph.runs:
+                run.font.size = Pt(10)
+
+# === Step 7: Save ===
+output_path = f"Deal_Summary_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.pptx"
 prs.save(output_path)
 print(f"✅ PowerPoint created: {output_path}")
