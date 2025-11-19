@@ -1,0 +1,349 @@
+
+# cell 3: Bloomberg wrapper (blpapi)
+# NOTE: This wrapper expects the Bloomberg Desktop API or Server API to be available and the session host/port set properly.
+# If you run this on a Bloomberg terminal machine the defaults will usually work.
+
+class BloombergClient:
+    def __init__(self, host="localhost", port=8194, verbose=False):
+        if blpapi is None:
+            raise RuntimeError("blpapi not installed in this environment.")
+        self.host = host
+        self.port = port
+        self.verbose = verbose
+        self.session = None
+
+    def start(self):
+        from blpapi import SessionOptions, Session
+        opts = SessionOptions()
+        opts.setServerHost(self.host)
+        opts.setServerPort(self.port)
+        session = Session(opts)
+        if not session.start():
+            raise ConnectionError("Failed to start Bloomberg session.")
+        if not session.openService("//blp/refdata"):
+            raise ConnectionError("Failed to open //blp/refdata")
+        self.session = session
+        if self.verbose:
+            print("Bloomberg session started.")
+
+    def stop(self):
+        if self.session:
+            self.session.stop()
+            self.session = None
+
+    def _send_request(self, request):
+        # send request and collect response dictionary
+        self.session.sendRequest(request)
+        data = []
+        while True:
+            event = self.session.nextEvent()
+            if event.eventType() in (blpapi.Event.RESPONSE, blpapi.Event.PARTIAL_RESPONSE):
+                for msg in event:
+                    data.append(msg)
+            if event.eventType() == blpapi.Event.RESPONSE:
+                break
+        return data
+
+    def get_refdata(self, securities: List[str], fields: List[str]) -> List[Dict[str,Any]]:
+        svc = self.session.getService("//blp/refdata")
+        req = svc.createRequest("ReferenceDataRequest")
+        for s in securities:
+            req.append("securities", s)
+        for f in fields:
+            req.append("fields", f)
+        responses = self._send_request(req)
+        out = []
+        for msg in responses:
+            out.append(msg.asElement().toDict())
+        return out
+
+    def get_mtg_cash_flow(self, cusip: str) -> pd.DataFrame:
+        """
+        Request MTG_CASH_FLOW (projected cash flows) which Bloomberg returns as an element list.
+        The exact field names can vary — inspect the returned dict if you need to adjust.
+        """
+        # Field name may be "MTG_CASH_FLOW" or similar depending on permissions and dataset.
+        resp = self.get_refdata([cusip], ["MTG_CASH_FLOW"])
+        if not resp:
+            raise RuntimeError("No data returned for cash flows.")
+        # The structure is usually nested; convert to DataFrame defensively:
+        raw = resp[0].get('securityData', [{}])[0]
+        fields = raw.get('fieldData', {})
+        cf_list = fields.get('MTG_CASH_FLOW') or fields.get('MTG_CASH_FLOW_DATA') or []
+        # cf_list typically is list of dicts with 'date', 'principal', 'interest', 'balance'
+        df = pd.DataFrame(cf_list)
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date']).dt.date
+        return df
+
+    def get_curve(self, tickers: List[str], field="PX_LAST") -> pd.DataFrame:
+        """
+        Utility to pull market instruments used for bootstrapping / discounting (e.g., swap rates, treasuries).
+        You will likely need to craft a curve construction separately for your shop.
+        """
+        resp = self.get_refdata(tickers, [field])
+        # convert to table
+        rows = []
+        for r in resp:
+            sdata = r.get('securityData', [{}])[0]
+            sec = sdata.get('security','')
+            fd = sdata.get('fieldData', {})
+            val = fd.get(field)
+            rows.append({'security': sec, field: val})
+        return pd.DataFrame(rows)
+
+cell
+
+
+# cell 4: prepayment and SMM helpers
+def cpr_to_smm(cpr: float) -> float:
+    """
+    Convert annual CPR (0-1) to monthly SMM.
+    SMM = 1 - (1 - CPR)^(1/12)
+    """
+    if cpr < 0:
+        raise ValueError("CPR must be non-negative")
+    return 1.0 - (1.0 - cpr) ** (1.0 / 12.0)
+
+def apply_prepayments(cf_df: pd.DataFrame, cpr: float, method="syt") -> pd.DataFrame:
+    """
+    Given a cashflow DataFrame that contains scheduled principal and outstanding balance,
+    apply prepayments using CPR override (annual, 0-1) and produce adjusted flows.
+    Expected columns (best-effort): 'date', 'scheduled_principal', 'interest', 'outstanding_balance'
+    Returns DataFrame with added 'prepaid' and 'total_principal' columns.
+    """
+    df = cf_df.copy().reset_index(drop=True)
+    smm = cpr_to_smm(cpr)
+    # if scheduled_principal missing, derive from balance differences
+    if 'scheduled_principal' not in df.columns:
+        if 'outstanding_balance' in df.columns:
+            df['scheduled_principal'] = df['outstanding_balance'].shift(0) - df['outstanding_balance'].shift(-1)
+            df.loc[df.index[-1],'scheduled_principal'] = df.loc[df.index[-1],'outstanding_balance']
+        else:
+            raise ValueError("Need scheduled_principal or outstanding_balance in cashflow data")
+    if 'outstanding_balance' not in df.columns:
+        # compute outstanding before each payment
+        df['outstanding_balance'] = df['scheduled_principal'].cumsum().shift(fill_value=0)
+        df['outstanding_balance'] = df['outstanding_balance'].iloc[::-1].cumsum().iloc[::-1]  # fallback
+
+    # compute prepayment amount each period: Prepay = SMM * (Outstanding - Scheduled Principal not yet removed)
+    prepaids = []
+    outstanding = df['outstanding_balance'].iloc[0] if len(df)>0 else 0.0
+    # We'll iterate to be explicit:
+    outs = df['outstanding_balance'].fillna(method='ffill').tolist()
+    sched = df['scheduled_principal'].fillna(0.0).tolist()
+    for i in range(len(df)):
+        # outstanding before scheduled principal payment at the period
+        out_before = outs[i]
+        scheduled = sched[i]
+        # available for prepay is out_before - scheduled (some conventions apply; this is a simple approach)
+        avail_for_prepay = max(out_before - scheduled, 0.0)
+        prepaid = smm * avail_for_prepay
+        prepaids.append(prepaid)
+
+    df['prepaid'] = prepaids
+    df['total_principal'] = df['scheduled_principal'] + df['prepaid']
+    return df
+
+cell
+
+# cell 5: advanced prepay modifiers
+def apply_preypay_with_modifiers(cf_df: pd.DataFrame,
+                                  base_cpr: float,
+                                  psa_multiplier: float = 1.0,
+                                  seasoning_months: int = 0,
+                                  cpr_vector: Optional[List[float]] = None) -> pd.DataFrame:
+    """
+    Support:
+      - base_cpr: annual (0-1)
+      - psa_multiplier: multiply standard PSA (100% PSA = base CPR vector, often 0.2% in month 1 etc.)
+      - seasoning_months: months to offset CPR (if you want to start lower and ramp)
+      - cpr_vector: if provided, overrides CPR per month (list of annual CPRs)
+    """
+    df = cf_df.copy().reset_index(drop=True)
+    n = len(df)
+    if cpr_vector is not None:
+        if len(cpr_vector) < n:
+            # pad with last value
+            cpr_vector = list(cpr_vector) + [cpr_vector[-1]]*(n - len(cpr_vector))
+    else:
+        # create flat vector with base_cpr, but implement PSA-style ramp if psa_multiplier != 1
+        # Standard PSA: CPR_t = min(6% * t, 6%) for t in months scaled to annual; in many usages PSA is in % annual.
+        # Here we create month-by-month CPR that ramps to base_cpr * psa_multiplier over 30 months.
+        ramp_months = 30
+        cpr_vector = []
+        for t in range(1, n+1):
+            ramp_factor = min(t / ramp_months, 1.0)
+            cpr_monthly = base_cpr * psa_multiplier * ramp_factor
+            cpr_vector.append(cpr_monthly)
+
+    # apply seasoning offset: shift vector right by seasoning_months (i.e., earlier months have lower cpr)
+    if seasoning_months > 0:
+        cpr_vector = [0.0]*seasoning_months + cpr_vector
+        cpr_vector = cpr_vector[:n]
+
+    # now apply month-by-month SMM and compute prepaids
+    out = df.copy()
+    out['prepaid'] = 0.0
+    out['total_principal'] = out.get('scheduled_principal', 0.0).fillna(0.0)
+    outs = out.get('outstanding_balance').tolist()
+    sched = out.get('scheduled_principal', pd.Series([0]*n)).tolist()
+    for i in range(n):
+        cpr_i = cpr_vector[i]
+        smm_i = cpr_to_smm(cpr_i)
+        out_before = outs[i] if i < len(outs) else 0.0
+        scheduled = sched[i] if i < len(sched) else 0.0
+        avail = max(out_before - scheduled, 0.0)
+        prepaid = smm_i * avail
+        out.loc[i,'prepaid'] = prepaid
+        out.loc[i,'total_principal'] = scheduled + prepaid
+    return out
+
+cell
+
+# cell 7: top-level price function that ties Bloomberg + pricing
+def price_mbs_from_bbg(cusip: str,
+                       cpr_override: float,
+                       bbg_client: Optional[BloombergClient] = None,
+                       curve_method: str = "flat",
+                       flat_zero: float = 0.05,
+                       psa_multiplier: float = 1.0,
+                       seasoning_months: int = 0) -> PriceResult:
+    """
+    Main function: fetch MTG cash flows, apply CPR override, build discount factors, price.
+    cpr_override is annual decimal (e.g., 0.06 for 6%)
+    """
+    # 1) fetch cash flows
+    if bbg_client is None:
+        raise RuntimeError("A BloombergClient instance is required to fetch market data.")
+
+    cf_raw = bbg_client.get_mtg_cash_flow(cusip)  # DataFrame
+    # normalize column names
+    col_map = {}
+    for possible in ['date','paymentdate','payment_date']:
+        if possible in cf_raw.columns:
+            col_map[possible] = 'date'
+    for possible in ['principal','scheduled_principal','sch_principal']:
+        if possible in cf_raw.columns:
+            col_map[possible] = 'scheduled_principal'
+    for possible in ['interest','int','scheduled_interest']:
+        if possible in cf_raw.columns:
+            col_map[possible] = 'interest'
+    for possible in ['balance','outstanding_balance','begin_balance']:
+        if possible in cf_raw.columns:
+            col_map[possible] = 'outstanding_balance'
+    cf = cf_raw.rename(columns=col_map)
+
+    # sanity: ensure we have scheduled_principal or outstanding_balance
+    if 'scheduled_principal' not in cf.columns and 'outstanding_balance' not in cf.columns:
+        raise RuntimeError("Returned cash flow data did not contain scheduled_principal or outstanding_balance.")
+
+    # 2) apply CPR vector + modifiers
+    adj = apply_preypay_with_modifiers(cf, base_cpr=cpr_override, psa_multiplier=psa_multiplier, seasoning_months=seasoning_months)
+
+    # 3) build discount factors (simple: flat zero)
+    n = len(adj)
+    dfs = build_discount_factors(n, flat_zero)  # In production, bootstrap from market instruments
+
+    # 4) price
+    price, mac, mod, wal, df_ann = price_cashflows(adj, dfs)
+
+    # wrap results
+    cashflows = []
+    for _, row in df_ann.iterrows():
+        cf_obj = CashFlow(
+            date = row.get('date', None),
+            scheduled_principal = float(row.get('scheduled_principal', 0.0)),
+            interest = float(row.get('interest', 0.0)),
+            outstanding_balance = float(row.get('outstanding_balance', 0.0) if 'outstanding_balance' in row else 0.0)
+        )
+        cashflows.append(cf_obj)
+    return PriceResult(price=price, ytm=None, dur_mac=mac, dur_mod=mod, wal=wal, cashflows=cashflows)
+
+
+cell
+
+# cell 8: example usage WITHOUT Bloomberg (fake cash flows) - useful for local testing / unit testing
+
+# Create a synthetic amortizing MBS schedule (12 months) for testing
+def create_synthetic_cf(balance=1000000, coupon_rate=0.05, months=60):
+    rows = []
+    outstanding = balance
+    monthly_coupon = coupon_rate / 12.0
+    # simple level scheduled principal for demo (not real amortization)
+    sched = balance / months
+    for m in range(1, months+1):
+        interest = outstanding * monthly_coupon
+        scheduled_principal = sched
+        rows.append({
+            'date': (dt.date.today() + dt.timedelta(days=30*m)),
+            'scheduled_principal': scheduled_principal,
+            'interest': interest,
+            'outstanding_balance': outstanding
+        })
+        outstanding = max(0.0, outstanding - scheduled_principal)
+    return pd.DataFrame(rows)
+
+# Test with synthetic CF
+df_synth = create_synthetic_cf(balance=1_000_000, coupon_rate=0.05, months=60)
+adj = apply_preypay_with_modifiers(df_synth, base_cpr=0.06, psa_multiplier=1.0)
+dfs = build_discount_factors(len(adj), zero_rate_annual=0.045)
+price, mac, mod, wal, df_ann = price_cashflows(adj, dfs)
+
+print(f"Test price: {price:,.2f}, MAC Dur: {mac:.3f}, MOD Dur: {mod:.3f}, WAL: {wal:.3f}")
+display(df_ann.head(10))
+
+cell
+
+# app.py - Streamlit front end
+import streamlit as st
+import pandas as pd
+import datetime as dt
+from your_module import BloombergClient, price_mbs_from_bbg  # import the functions/classes above
+
+st.title("SYT GO Replica - MBS Pricing")
+
+cusip = st.text_input("CUSIP / Security", value="")
+cpr = st.number_input("CPR (annual %)", min_value=0.0, max_value=50.0, value=6.0) / 100.0
+flat_zero = st.number_input("Flat discount zero (%)", min_value=0.0, max_value=50.0, value=4.5) / 100.0
+psa = st.number_input("PSA multiplier (1 = 100%)", min_value=0.0, max_value=10.0, value=1.0)
+season = st.number_input("Seasoning months", min_value=0, max_value=360, value=0)
+
+if st.button("Price"):
+    client = BloombergClient()
+    try:
+        client.start()
+        res = price_mbs_from_bbg(cusip, cpr, bbg_client=client, flat_zero=flat_zero, psa_multiplier=psa, seasoning_months=season)
+        st.metric("Price (PV)", f"{res.price:,.2f}")
+        st.write("Duration (Macaulay)", res.dur_mac)
+        st.write("Duration (Modified)", res.dur_mod)
+        st.write("WAL (years)", res.wal)
+        cf_df = pd.DataFrame([{
+            "date": cf.date,
+            "scheduled_principal": cf.scheduled_principal,
+            "interest": cf.interest,
+            "outstanding_balance": cf.outstanding_balance
+        } for cf in res.cashflows])
+        st.dataframe(cf_df)
+    except Exception as e:
+        st.error(str(e))
+    finally:
+        try:
+            client.stop()
+        except:
+            pass
+
+cell
+
+# cell 10: quick unit tests
+def test_cpr_to_smm():
+    assert abs(cpr_to_smm(0.0) - 0.0) < 1e-9
+    # CPR = 1.0 -> SMM = 1.0
+    assert abs(cpr_to_smm(1.0) - 1.0) < 1e-9
+    # typical 6% CPR
+    smm6 = cpr_to_smm(0.06)
+    assert 0.0048 < smm6 < 0.006  # approx 0.00486
+
+test_cpr_to_smm()
+print("Basic tests passed.")
+
