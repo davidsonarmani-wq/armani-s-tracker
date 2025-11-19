@@ -1,0 +1,433 @@
+# RMBS CALL ANALYSIS - single cell app for Jupyter (Voila-friendly)
+# Paste the whole cell into a notebook and run. Then: voila notebook.ipynb
+
+import math
+import datetime as dt
+from typing import Optional, List, Dict, Any
+import io
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+plt.ioff()
+
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+# -----------------------
+# Helper finance funcs
+# -----------------------
+def cpr_to_smm(cpr: float) -> float:
+    """Annual CPR (decimal) -> monthly SMM."""
+    if cpr is None or cpr <= 0:
+        return 0.0
+    return 1.0 - (1.0 - cpr) ** (1.0 / 12.0)
+
+def _get_row_cpr_field(row: pd.Series, candidates: List[str]) -> Optional[float]:
+    for c in candidates:
+        if c in row.index:
+            try:
+                val = row[c]
+                if pd.isna(val): continue
+                v = float(val)
+                # support percent (6 or 6.0) or decimal (0.06)
+                if v > 1: 
+                    return v/100.0
+                return v
+            except Exception:
+                continue
+    return None
+
+def build_cpr_vector_from_row(row: pd.Series, n_months: int, long_run_cpr: float) -> List[float]:
+    """Use available 1mo/3mo/6mo values then long-run."""
+    one = _get_row_cpr_field(row, ['1mo cpr','1 mo cpr','1m cpr','1m_cpr','1mo_cpr'])
+    three = _get_row_cpr_field(row, ['3mo cpr','3 mo cpr','3m cpr','3m_cpr','3mo_cpr'])
+    six = _get_row_cpr_field(row, ['6ml cpr','6mo cpr','6 mo cpr','6m cpr','6m_cpr','6ml cpr'])
+    v = []
+    for m in range(1, n_months+1):
+        if m == 1 and one is not None:
+            v.append(one)
+        elif 2 <= m <= 3 and three is not None:
+            v.append(three)
+        elif 4 <= m <= 6 and six is not None:
+            v.append(six)
+        else:
+            v.append(long_run_cpr)
+    return v
+
+def build_flat_dfs(n_months: int, zero_rate_annual: float) -> np.ndarray:
+    """Flat zero monthly discount factors for months 1..n_months."""
+    r_month = (1 + zero_rate_annual) ** (1/12) - 1
+    months = np.arange(1, n_months+1)
+    dfs = 1.0 / ((1.0 + r_month) ** months)
+    return dfs
+
+# -----------------------
+# Cashflow builder
+# -----------------------
+def build_remaining_cashflows(row: pd.Series) -> pd.DataFrame:
+    """
+    Build remaining cashflow schedule from a single row.
+    Looks for several common column names for current balance, rem term, coupon.
+    If rem_term missing, defaults to 360; if coupon missing, defaults to 5%.
+    Returns DataFrame with columns: period, date, scheduled_principal, interest, outstanding_balance
+    """
+    # Find balance
+    bal_candidates = ['tranche curr bal','tranche_curr_bal','last balance','last_balance','last_balance.','tranche_curr_bal']
+    bal = None
+    for c in bal_candidates:
+        if c in row.index and not pd.isna(row[c]):
+            try:
+                bal = float(row[c])
+                break
+            except Exception:
+                continue
+    if bal is None:
+        # try other likely names
+        for c in row.index:
+            if 'bal' in c and not pd.isna(row[c]):
+                try:
+                    bal = float(row[c]); break
+                except:
+                    pass
+    if bal is None:
+        raise RuntimeError("Could not find current balance for tranche (checked many common names).")
+
+    # find rem term (months)
+    rem_candidates = ['rem term','last rem term','last_rem_term','rem_term','remaining term','remterm']
+    rem = None
+    for c in rem_candidates:
+        if c in row.index and not pd.isna(row[c]):
+            try:
+                rem = int(float(row[c])); break
+            except:
+                continue
+    if rem is None or rem <= 0:
+        rem = 360  # fallback
+
+    # coupon
+    coupon_candidates = ['coupon','collat gross coupon','coupon%','cpn']
+    coupon = None
+    for c in coupon_candidates:
+        if c in row.index and not pd.isna(row[c]):
+            try:
+                coupon = float(row[c])
+                if coupon > 1:
+                    coupon = coupon / 100.0
+                break
+            except:
+                continue
+    if coupon is None:
+        coupon = 0.05
+
+    # Build simple level scheduled principal = bal / rem
+    scheduled_principal = bal / rem
+    monthly_rate = coupon / 12.0
+    rows = []
+    outstanding = bal
+    today = dt.date.today()
+    for m in range(1, rem+1):
+        interest = outstanding * monthly_rate
+        scheduled = scheduled_principal
+        rows.append({
+            'period': m,
+            'date': today + dt.timedelta(days=30*m),
+            'scheduled_principal': scheduled,
+            'interest': interest,
+            'outstanding_balance': outstanding
+        })
+        outstanding = max(0.0, outstanding - scheduled)
+        if outstanding <= 1e-6:
+            break
+    return pd.DataFrame(rows)
+
+# -----------------------
+# Apply CPR prepayments
+# -----------------------
+def apply_prepayments_to_cf(cf_df: pd.DataFrame, cpr_vector: List[float]) -> pd.DataFrame:
+    """
+    Applies CPR vector (annual decimals) across the CF schedule.
+    Returns cf_df with prepaid, total_principal, outstanding_after and payment columns.
+    """
+    df = cf_df.copy().reset_index(drop=True)
+    n = len(df)
+    if len(cpr_vector) < n:
+        cpr_vector = cpr_vector + [cpr_vector[-1]]*(n - len(cpr_vector))
+    prepaids = []
+    total_princs = []
+    outs = df['outstanding_balance'].fillna(method='ffill').tolist()
+    scheds = df['scheduled_principal'].tolist()
+    for i in range(n):
+        annual_cpr = cpr_vector[i]
+        smm = cpr_to_smm(annual_cpr)
+        out_before = outs[i]
+        scheduled = scheds[i]
+        avail = max(out_before - scheduled, 0.0)
+        prepaid = smm * avail
+        total_pr = scheduled + prepaid
+        prepaids.append(prepaid)
+        total_princs.append(total_pr)
+    df['prepaid'] = prepaids
+    df['total_principal'] = total_princs
+    df['outstanding_after'] = (df['outstanding_balance'] - df['total_principal']).clip(lower=0.0)
+    df['payment'] = df['interest'] + df['total_principal']
+    return df
+
+# -----------------------
+# Pricing & measures
+# -----------------------
+def price_adjusted_cf(cf_adj: pd.DataFrame, flat_zero: float) -> Dict[str, Any]:
+    """Discount adjusted CF using flat zero. Returns price and summary measures and annuity df."""
+    df = cf_adj.copy().reset_index(drop=True)
+    n = len(df)
+    dfs = build_flat_dfs(n, flat_zero)
+    df['month'] = np.arange(1, n+1)
+    df['df'] = dfs[:n]
+    df['pv'] = df['payment'] * df['df']
+    price = df['pv'].sum()
+    df['tyrs'] = df['month'] / 12.0
+    mac = (df['pv'] * df['tyrs']).sum() / price if price > 0 else 0.0
+    r_month = max((1.0 / dfs[0]) - 1.0, 0.0)
+    r_annual = (1 + r_month) ** 12 - 1.0
+    mod = mac / (1 + r_annual) if (1 + r_annual) != 0 else 0.0
+    principal_total = df['total_principal'].sum()
+    wal = (df['total_principal'] * df['tyrs']).sum() / principal_total if principal_total > 0 else 0.0
+    return {'price': price, 'mac': mac, 'mod': mod, 'wal': wal, 'ann': df}
+
+# -----------------------
+# Call economics
+# -----------------------
+def compute_call_economics(row: pd.Series,
+                           cf_adj: pd.DataFrame,
+                           flat_zero_keep: float,
+                           new_issue_zero: float,
+                           call_price_pct: float = 1.0,
+                           issuance_cost_pct: float = 0.005) -> Dict[str, Any]:
+    """Compute cost to keep, cost to call, resecuritization proceeds, net cost, and decision."""
+    priced_keep = price_adjusted_cf(cf_adj, flat_zero_keep)
+    cost_keep = priced_keep['price']
+    # remaining balance ideally from outstanding_balance first period
+    remaining_balance = cf_adj['outstanding_balance'].iloc[0]
+    call_payment = call_price_pct * remaining_balance
+    priced_new = price_adjusted_cf(cf_adj, new_issue_zero)
+    gross_proceeds = priced_new['price']
+    issuance_fees = issuance_cost_pct * gross_proceeds
+    net_proceeds = gross_proceeds - issuance_fees
+    net_cost_call = call_payment - net_proceeds
+    decision = 'CALL' if net_cost_call < cost_keep else 'LEAVE'
+    return {
+        'cost_keep': cost_keep,
+        'call_payment': call_payment,
+        'gross_proceeds': gross_proceeds,
+        'issuance_fees': issuance_fees,
+        'net_proceeds': net_proceeds,
+        'net_cost_call': net_cost_call,
+        'decision': decision,
+        'priced_keep': priced_keep,
+        'priced_new': priced_new
+    }
+
+# -----------------------
+# File reading and utilities
+# -----------------------
+def try_read_uploaded(uploader_widget):
+    if not uploader_widget.value:
+        return None
+    item = list(uploader_widget.value.values())[0]
+    name = item['metadata']['name']
+    content = item['content']
+    if name.lower().endswith('.csv'):
+        df = pd.read_csv(io.BytesIO(content))
+    else:
+        df = pd.read_excel(io.BytesIO(content), sheet_name=0)
+    # normalize column names
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
+
+def is_callable_row(row: pd.Series, today: dt.date) -> bool:
+    # check boolean flags or callable as of date
+    for flag in ['callable this month','callable thismonth','callable_this_month']:
+        if flag in row.index and str(row[flag]).strip().lower() in ['y','yes','true','1']:
+            return True
+    if 'callable as of date' in row.index and not pd.isna(row['callable as of date']):
+        try:
+            d = pd.to_datetime(row['callable as of date']).date()
+            return d <= today
+        except:
+            pass
+    for c in ['callable 30day','callable 60day','callable 90day','callable 180day','90 day call flag','180 day call flag']:
+        if c in row.index and str(row[c]).strip().lower() in ['y','yes','true','1']:
+            return True
+    return False
+
+# -----------------------
+# UI: Widgets
+# -----------------------
+uploader = widgets.FileUpload(accept='.xls,.xlsx,.xlsm,.csv', multiple=False, description='Upload xlsm/csv')
+long_run_cpr_input = widgets.FloatText(value=6.0, description='Long-run CPR (%)', step=0.5)
+flat_zero_input = widgets.FloatText(value=4.5, description='Discount keep (%)', step=0.01)
+new_issue_zero_input = widgets.FloatText(value=3.5, description='New-issue disc (%)', step=0.01)
+call_price_input = widgets.FloatText(value=100.0, description='Call price (enter 100 for par)')
+issuance_cost_input = widgets.FloatText(value=0.50, description='Issuance cost (%)')
+run_button = widgets.Button(description='Run Call Analysis', button_style='primary')
+
+out_summary = widgets.Output(layout={'border': '1px solid black'})
+out_table = widgets.Output()
+out_details = widgets.Output()
+
+display(widgets.VBox([
+    widgets.HTML("<h3>RMBS Call Analysis (no Bloomberg) — Upload your xlsm/csv</h3>"),
+    uploader,
+    widgets.HBox([long_run_cpr_input, flat_zero_input, new_issue_zero_input]),
+    widgets.HBox([call_price_input, issuance_cost_input]),
+    run_button,
+    out_summary,
+    out_table
+]))
+
+# global holder for details
+ANALYSIS_DETAILS = []
+
+# -----------------------
+# Main runner
+# -----------------------
+def run_call_analysis(b):
+    global ANALYSIS_DETAILS
+    ANALYSIS_DETAILS = []
+    out_summary.clear_output()
+    out_table.clear_output()
+    out_details.clear_output()
+
+    df_input = try_read_uploaded(uploader)
+    if df_input is None:
+        with out_summary:
+            print("Upload your .xlsm/.xlsx/.csv file first.")
+        return
+
+    # Parse parameters (accept % typed as 4.5 or 0.045)
+    def pct_to_decimal(x):
+        try:
+            v = float(x)
+        except:
+            return 0.0
+        return v/100.0 if v > 1 else v
+
+    long_run_cpr = pct_to_decimal(long_run_cpr_input.value)
+    flat_zero = pct_to_decimal(flat_zero_input.value)
+    new_issue_zero = pct_to_decimal(new_issue_zero_input.value)
+    call_price_raw = float(call_price_input.value)
+    call_price_pct = call_price_raw/100.0 if call_price_raw > 10 else call_price_raw
+    issuance_cost_pct = pct_to_decimal(issuance_cost_input.value)
+
+    today = dt.date.today()
+    results = []
+    details = []
+
+    for idx, row in df_input.iterrows():
+        # proceed only if callable
+        try:
+            if not is_callable_row(row, today):
+                continue
+
+            # build remaining CFs
+            cf = build_remaining_cashflows(row)
+            n = len(cf)
+            cpr_vector = build_cpr_vector_from_row(row, n_months=n, long_run_cpr=long_run_cpr)
+            cf_adj = apply_prepayments_to_cf(cf, cpr_vector)
+
+            econ = compute_call_economics(row, cf_adj,
+                                         flat_zero_keep=flat_zero,
+                                         new_issue_zero=new_issue_zero,
+                                         call_price_pct=call_price_pct,
+                                         issuance_cost_pct=issuance_cost_pct)
+
+            summary = {
+                'index': int(idx),
+                'bloomberg_ticker': row.get('bloomberg ticker',''),
+                'other_name': row.get('other name',''),
+                'cusip': row.get('cusip',''),
+                'issuer': row.get('issuer',''),
+                'sector_std': row.get('sector std',''),
+                'tranche_orig_bal': row.get('tranche orig bal', np.nan),
+                'tranche_curr_bal': row.get('tranche curr bal', row.get('last balance', np.nan)),
+                'coupon': row.get('coupon', np.nan),
+                'callable_as_of': row.get('callable as of date', ''),
+                'cost_keep': econ['cost_keep'],
+                'call_payment': econ['call_payment'],
+                'gross_proceeds': econ['gross_proceeds'],
+                'issuance_fees': econ['issuance_fees'],
+                'net_proceeds': econ['net_proceeds'],
+                'net_cost_call': econ['net_cost_call'],
+                'decision': econ['decision']
+            }
+            results.append(summary)
+            details.append({'index': int(idx), 'econ': econ, 'cf_adj': cf_adj})
+        except Exception as e:
+            results.append({'index': int(idx), 'cusip': row.get('cusip',''), 'error': str(e)})
+
+    res_df = pd.DataFrame(results)
+    if not res_df.empty:
+        res_df['benefit'] = res_df.apply(lambda r: (r['cost_keep'] - r['net_cost_call']) if (pd.notna(r.get('cost_keep')) and pd.notna(r.get('net_cost_call'))) else np.nan, axis=1)
+        res_df = res_df.sort_values(by='benefit', ascending=False)
+
+    with out_summary:
+        clear_output()
+        print(f"Callable tranches processed: {len(res_df)}")
+        if not res_df.empty:
+            print("Top 10 candidates by benefit (positive -> calling looks better):")
+            display(res_df.head(10)[['cusip','other_name','tranche_curr_bal','coupon','cost_keep','net_cost_call','benefit','decision']])
+
+    with out_table:
+        clear_output()
+        display(res_df)
+
+    ANALYSIS_DETAILS = details
+
+run_button.on_click(run_call_analysis)
+
+# -----------------------
+# Drill-down inspector
+# -----------------------
+inspect_idx = widgets.IntText(value=0, description='Row index')
+inspect_button = widgets.Button(description='Inspect tranche')
+inspect_out = widgets.Output()
+
+display(widgets.HBox([inspect_idx, inspect_button]), inspect_out)
+
+def inspect_action(b):
+    inspect_out.clear_output()
+    i = int(inspect_idx.value)
+    rec = None
+    for d in ANALYSIS_DETAILS:
+        if d['index'] == i:
+            rec = d
+            break
+    if rec is None:
+        with inspect_out:
+            print("No detail found for that index. Ensure index matches original input row index and tranche was callable.")
+        return
+    econ = rec['econ']
+    cf = rec['cf_adj']
+    with inspect_out:
+        clear_output()
+        print("Economics summary:")
+        print(f"Cost to keep (PV) : {econ['cost_keep']:.2f}")
+        print(f"Call payment       : {econ['call_payment']:.2f}")
+        print(f"Gross proceeds     : {econ['gross_proceeds']:.2f}")
+        print(f"Issuance fees      : {econ['issuance_fees']:.2f}")
+        print(f"Net proceeds       : {econ['net_proceeds']:.2f}")
+        print(f"Net cost to call   : {econ['net_cost_call']:.2f}")
+        print(f"Decision           : {econ['decision']}")
+        display(cf.head(20))
+        fig, axes = plt.subplots(1,2, figsize=(12,4))
+        axes[0].plot(cf['period'], cf['payment'].cumsum())
+        axes[0].set_title('Cumulative payments (periods)')
+        axes[1].plot(cf['period'], cf['outstanding_after'])
+        axes[1].set_title('Outstanding balance after payments')
+        display(fig)
+        plt.close(fig)
+
+inspect_button.on_click(inspect_action)
+
+# End of single-cell app
+print("RMBS Call Analysis app loaded. Upload file and press 'Run Call Analysis'.")
